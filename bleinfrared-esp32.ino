@@ -271,6 +271,7 @@ static void processSerial()
   {
     return;
   }
+  // HEX -> BINARY는 아직 미구현
   for (int i = 0; i < length; i++)
   {
     char hi = serialBuffer[i * 2 + 0];
