@@ -3,8 +3,9 @@
 // https://github.com/espressif/esp-idf/blob/v4.3/examples/peripherals/rmt/morse_code/main/morse_code_main.c
 #include <driver/rmt.h>
 
-String serialBuffer;
-unsigned long serialTime;
+#define BUFFER_MAX 512
+char serialBuffer[BUFFER_MAX];
+size_t serialBufferLength = 0;
 
 // 적외선 신호 정의
 // 1. 매직넘버
@@ -24,7 +25,7 @@ typedef struct __attribute__ ((packed))
 
 typedef struct __attribute__ ((packed))
 {
-  bit_us_t start;
+  bit_us_t lead;
   bit_us_t one;
   bit_us_t zero;
   bit_us_t end;
@@ -49,9 +50,9 @@ static void dumpData(const header_t *header, const uint8_t *data, size_t length)
   Serial.println(header->nibble);
   Serial.println("duration");
   Serial.print("  start: +");
-  Serial.print(ntohl(header->duration.start.mark));
+  Serial.print(ntohl(header->duration.lead.mark));
   Serial.print(",-");
-  Serial.println(ntohl(header->duration.start.space));
+  Serial.println(ntohl(header->duration.lead.space));
   Serial.print("  one: +");
   Serial.print(ntohl(header->duration.one.mark));
   Serial.print(",-");
@@ -99,7 +100,7 @@ static void writeIR(const header_t *header, const uint8_t *data, size_t length)
   }
   dumpData(header, data, length);
 
-  rmt_item32_fill(items + index++, ntohl(duration->start.mark), ntohl(duration->start.space));
+  rmt_item32_fill(items + index++, ntohl(duration->lead.mark), ntohl(duration->lead.space));
 
   for (int i = 0; i < length; i++)
   {
@@ -126,9 +127,7 @@ static void writeIR(const header_t *header, const uint8_t *data, size_t length)
 
   rmt_item32_fill(items + index++, ntohl(duration->end.mark), ntohl(duration->end.space));
 
-  digitalWrite(LED_BUILTIN, HIGH);
   ESP_ERROR_CHECK(rmt_write_items(RMT_CHANNEL_1, items, bitCount + 2, true));
-  digitalWrite(LED_BUILTIN, LOW);
 
   free(items);
 }
@@ -158,6 +157,7 @@ public:
     deviceConnected = true;
 
     Serial.println("onConnect");
+    digitalWrite(LED_BUILTIN, HIGH);
   }
 
   void onDisconnect(BLEServer *pServer) override
@@ -165,6 +165,7 @@ public:
     deviceConnected = false;
 
     Serial.println("onDisconnect");
+    digitalWrite(LED_BUILTIN, LOW);
   }
 };
 
@@ -192,6 +193,7 @@ void setup()
   Serial.begin(9600);
 
   pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
 
   pCallbacks = new MyCallbacks();
 
@@ -245,13 +247,6 @@ static void processRx()
   Serial.print("magic: ");
   Serial.println(CONTROLLER_MAGIC == int16_t(ntohs(header->magic)) ? "ok" : "nok");
 
-  Serial.print("net: ");
-  Serial.print(data[0], HEX);
-  Serial.println(data[1], HEX);
-
-  Serial.print("ntohs: ");
-  Serial.println(ntohs(header->magic), HEX);
-
   if (int16_t(ntohs(header->magic)) != CONTROLLER_MAGIC)
   {
     return;
@@ -259,13 +254,55 @@ static void processRx()
   writeIR(header, data + sizeof(header_t), length - sizeof(header_t));
 }
 
+static uint8_t decodeHex(char hex)
+{
+  if (hex >= '0' && hex <= '9')
+  {
+    return hex - '0';
+  }
+  if (hex >= 'A' && hex <= 'F')
+  {
+    return hex - 'A' + 10;
+  }
+  if (hex >= 'a' && hex <= 'f')
+  {
+    return hex - 'a' + 10;
+  }
+  throw "not a hexadecimal character";
+}
+
 static void processSerial()
 {
-  if (serialBuffer.length() % 2)
+  if (serialBufferLength % 2)
   {
+    Serial.println("not divide by 2");
     return;
   }
-  size_t length = serialBuffer.length() / 2;
+  for (size_t i = 0; i < serialBufferLength; i++)
+  {
+    const char ch = serialBuffer[i];
+
+    if (!(ch >= '0' && ch <= '9') && !(ch >= 'A' && ch <= 'F') && !(ch >= 'a' && ch <= 'f'))
+    {
+      Serial.println("not hex string");
+      Serial.println(serialBuffer);
+      
+      for (int rep = 0; rep < i; rep++)
+      {
+        Serial.print(" ");
+      }
+      Serial.print("^");
+
+      return;
+    }
+  }
+
+  size_t length = serialBufferLength / 2;
+  if (length <= sizeof(header_t))
+  {
+    Serial.println("incorrect data");
+    return;
+  }
   uint8_t *data = (uint8_t*)malloc(length);
   if (!data)
   {
@@ -276,7 +313,10 @@ static void processSerial()
   {
     char hi = serialBuffer[i * 2 + 0];
     char lo = serialBuffer[i * 2 + 1];
+
+    data[i] = decodeHex(hi) << 4 | decodeHex(lo);
   }
+  writeIR(reinterpret_cast<header_t*>(data), data + sizeof(header_t), length - sizeof(header_t));
 
   free(data);
 }
@@ -286,23 +326,25 @@ void loop()
   // 시리얼로 수신되는 데이터 확인 및 처리
   if (Serial.available())
   {
-    // 현재 기준 100 밀리초 이전에 수신 된 데이터는 버림
-    unsigned long uptime = millis();
-    if (serialTime > uptime + 100)
+    if (serialBufferLength >= BUFFER_MAX)
     {
-      serialBuffer.clear();
+      serialBufferLength = 0;
     }
-    serialTime = uptime;
 
     char ch = Serial.read();
-    if (ch == '\n')
+    if (ch == '\r' || ch == '\n')
     {
+      if (serialBufferLength == 0)
+      {
+        return;
+      }
+
       processSerial();
-      serialBuffer.clear();
+      serialBufferLength = 0;
     }
     else
     {
-      serialBuffer += ch;
+      serialBuffer[serialBufferLength++] = ch;
     }
   }
 
